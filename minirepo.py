@@ -336,11 +336,11 @@ def get_config(config_file):
 		with open(config_file, 'w') as w:
 			json.dump(config, w, indent=2)
 
-    for c in sorted(config):
-        print('%-15s = %s' % (c,config[c]))
-    print('Using config file %s ' % config_file)
+	for c in sorted(config):
+		print('%-15s = %s' % (c,config[c]))
+	print('Using config file %s ' % config_file)
 
-    return config
+	return config
 
 def save_json(pids):
     # concatenate output from each worker
@@ -379,7 +379,7 @@ def main(repository='', processes=0):
 		path=os.environ.get("MINIREPO_CONFIG", "~/.minirepo"))
 
     config 			= get_config(config_file=config_file)
-    REPOSITORY      = config["repository"]
+    REPOSITORY      = os.path.expanduser(config["repository"])
     PROCESSES       = config["processes"]
     PYTHON_VERSIONS = config["python_versions"]
     PACKAGE_TYPES   = config["package_types"]
