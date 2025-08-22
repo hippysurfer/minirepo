@@ -326,9 +326,9 @@ def main(repository='', processes=0):
 	
 	print('/******** Minirepo ********/')
 	
-	# get configuraiton values
+	# get configuration values
 	config 			= get_config()
-	REPOSITORY		= config["repository"]
+	REPOSITORY		= os.path.expanduser(config["repository"])
 	PROCESSES		= config["processes"]
 	PYTHON_VERSIONS	= config["python_versions"]
 	PACKAGE_TYPES	= config["package_types"]
