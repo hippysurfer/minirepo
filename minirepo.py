@@ -263,9 +263,12 @@ def worker(args):
 	
 	return (pid, packages_downloaded, bytes_downloaded, bytes_cleaned)
 
-def get_config():
-	config_file = os.path.expanduser("~/.minirepo")
+def get_config(config_file):
+	config_file = config_file
+
+	# Default repository path (only used if the config file does not exit)
 	repository = os.path.expanduser("~/minirepo")
+
 	processes = PROCESSES
 	try:
 		with open(config_file, 'r') as f:
@@ -326,8 +329,12 @@ def main(repository='', processes=0):
 	
 	print('/******** Minirepo ********/')
 	
-	# get configuraiton values
-	config 			= get_config()
+	# get configuration values
+
+	config_file = os.path.expanduser(
+		path=os.environ.get("MINIREPO_CONFIG", "~/.minirepo"))
+
+	config 			= get_config(config_file=config_file)
 	REPOSITORY		= config["repository"]
 	PROCESSES		= config["processes"]
 	PYTHON_VERSIONS	= config["python_versions"]
