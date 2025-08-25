@@ -2,446 +2,468 @@
 #
 # download all source packages from https://pypi.python.org
 
+from pathlib import Path
+import argparse
 import sys
 import os
-import signal  
 import time
-import shutil
-import random
-import hashlib
 import logging
-import tempfile
 import json
+from typing import Any, NoReturn
 import requests
-import multiprocessing as mp
-from xml.etree import ElementTree
-from bs4 import BeautifulSoup
-from wheel_filename import parse_wheel_filename
+import asyncio
+import aiofiles
+from lxml import html
+import aiohttp
+from aiohttp import ClientSession, ClientTimeout
+from tqdm.asyncio import tqdm_asyncio
+from wheel_filename import parse_wheel_filename, InvalidFilenameError
 
-# logging.basicConfig(level=logging.warning)
 
-# global variables
-# repository folder
-REPOSITORY = ''
-# download a max number of packages, useful for testing
-MAX = 0
-# number of processes to run in parallel
-PROCESSES = mp.cpu_count()
+TIMEOUT: ClientTimeout = aiohttp.ClientTimeout(
+    total=300,  # maximum total request time
+    connect=10,  # time to establish connection
+    sock_connect=10,  # time to wait before socket connect
+    sock_read=100,  # time to wait between reads
+)
 
-# filters, only interested in this types
-# PYTHON_VERSIONS = [
-# 	'2', '2.2', '2.3', '2.4', '2.5', '2.6', '2.7', '2.7.6', 
-# 	'3', '3.0', '3.1', '3.2', '3.3', '3.4', '3.5', '3.6', '3.7', 
-# 	'cp26', 'cp27', 'cp3', 'cp32', 'cp33', 'cp34', 'cp35', 
-# 	'cp36', 'cp37', 'py2', 'py2.py3', 'py26', 'py27', 'py3', 
-# 	'py3.5', 'py3.6', 'py3.7', 'py32, py33, py34', 'py35', 'py36', 
-# 	'py37', 'source', 'any']
-# PACKAGE_TYPES = ['bdist_egg', 'bdist_wheel', 'sdist']
-# EXTENSIONS = [ 'bz2', 'egg', 'exe', 'gz', 'tgz', 'whl', 'zip']
-# PLATFORMS = ['linux', 'win32', 'win_amd64', 'macosx','any']
+MINIREPO_CONFIG = os.path.expanduser(os.environ.get("MINIREPO_CONFIG", "~/.minirepo"))
 
-# only python 3.10
-PYTHON_VERSIONS = ['cp310','py3','py2.py3','py3.10','py310','any']
-PACKAGE_TYPES = ['bdist_wheel',]
-EXTENSIONS = ['whl',]
-PLATFORMS = ['win_amd64','any']
+DEFAULT_CONFIG = {
+    "repository": os.path.expanduser("~/minirepo"),
+    "python_versions": ["cp310", "py3", "py2.py3", "py3.10", "py310", "any"],
+    "package_types": [
+        "bdist_wheel",
+    ],
+    "extensions": [
+        "whl",
+    ],
+    "platforms": ["win_amd64", "any"],
+}
 
-python_versions = {}
-package_types = {}
-extensions = {}
-platforms = {}
 
-# I had to do this to setup max_retries in requests
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(max_retries=2)
-session.mount('https://', adapter)
+def chain_generators(urls, *filters) -> Any:
+    """Apply a series of generator filters to the list of URLs."""
 
-# Metadata file path
-METADATA_FILE = "metadata.json"  # New
+    for f in filters:
+        urls = f(urls)
+    return urls
 
-# Load existing metadata from file
-def load_metadata():  # New
-    if os.path.exists(METADATA_FILE):  # New
-        with open(METADATA_FILE, "r") as f:  # New
-            return json.load(f)  # New
-    return {}  # New
 
-# Save updated metadata back to file
-def save_metadata(metadata):  # New
-    with open(METADATA_FILE, "w") as f:  # New
-        json.dump(metadata, f, indent=4)  # New
+async def fetch_and_parse(url: str):
+    """Fetch a URL and parse the HTML to extract all links."""
 
-# Check if a package is already downloaded
-def is_package_downloaded(metadata, package_name, version, md5_digest):  # New
-    if package_name in metadata:  # New
-        package_info = metadata[package_name]  # New
-        if package_info["version"] == version and package_info["md5_digest"] == md5_digest:  # New
-            return True  # New
-    return False  # New
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            total_size = int(resp.headers.get("Content-Length", 0))
 
-# Update the metadata with newly downloaded package information
-def update_metadata(metadata, package_name, version, size, md5_digest):  # New
-    metadata[package_name] = {  # New
-        "version": version,  # New
-        "size": size,  # New
-        "md5_digest": md5_digest  # New
-    }  # New
+            # Accumulate chunks in memory (PyPI index is ~20–30 MB, fits fine)
+            content = bytearray()
+            with tqdm_asyncio(
+                total=total_size, unit="B", unit_scale=True, desc="Downloading"
+            ) as pbar:
+                async for chunk in resp.content.iter_chunked(65536):
+                    content.extend(chunk)
+                    pbar.update(len(chunk))
 
-def bytes_human(num):
-    for x in ['bytes','KB','MB','GB']:
-        if num < 1024.0:
-            return "%3.1f%s" % (num, x)
-        num /= 1024.0
-    return "%3.1f%s" % (num, 'TB')
+    # Parse once after full download
+    tree = html.fromstring(bytes(content))
+    links = [a.text for a in tree.xpath("//a")]
+    return links
 
-def get_names():
-        # xmlrpc is slower
-        # import xmlrpclib
-        # xmlrpclib.ServerProxy('https://pypi.python.org/pypi')
-        # return client.list_packages()
 
-    # use simple API
-    # resp = urllib2.urlopen('https://pypi.python.org/simple')
-    # tree = ElementTree.parse(resp)
-    resp = requests.get('https://pypi.python.org/simple')
-    html_content = resp.content.decode('utf-8')
+async def get_names():
+    """Fetch the list of package names from PyPI simple index."""
+    return await fetch_and_parse("https://pypi.org/simple/")
+
+
+def load_cache(cache_path, ttl):
+    """Load cached data if it exists and is fresh."""
+    if not cache_path.exists():
+        return None
     try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        return [a.text for a in soup.find_all('a')]
-    except Exception as e:
-        print(f"HTML ParseError: {e}")
-        sys.exit(1)
+        with open(cache_path, "r") as f:
+            cached = json.load(f)
+        if time.time() - cached["timestamp"] > ttl:
+            return None
+        return cached["data"]
+    except Exception:
+        return None
 
-    tree = ElementTree.fromstring(
-        # Hotfix because the XML parser has issues with this specific tag, we remove it from the input
-        # TODO: A different XML parser might have less issues, see if this can be fixed properly
-        resp.content.replace(b'<meta name="pypi:repository-version" content="1.1">', b'')
-    )
-    return [a.text for a in tree.iter('a')]
 
-def get_chunks(seq, num):
-    """split seq in chunks of size num,
-    used to divide tasks for workers
-    """
-    avg = len(seq)/float(num)
-    out = []
-    last = 0.0
-    while last < len(seq):
-        out.append(seq[int(last):int(last + avg)])
-        last += avg
-    return out
+def save_cache(cache_path, data) -> None:
+    """Save data to cache with current timestamp."""
+    with open(cache_path, "w") as f:
+        json.dump({"timestamp": time.time(), "data": data}, f)
 
-def prune(releases, current_version):
-    '''
-    delete all versions different than current_version
-    and return bytes deleted
-    '''
-    bytes = 0
-    for v, dist_list in releases.items():
-        if v == current_version:
-            continue
-        for dist in dist_list:
-            path = '%s/%s' % (REPOSITORY, dist['filename']) 
-            if os.path.exists(path):
-                bytes += os.stat(path).st_size
-                os.remove(path)
-                logging.warning('Deleted   : %s' % dist['filename'])
-    return bytes
 
-def worker(args):
-    '''
-    function to run in parallel, names is a list of packages names,
-    return tuple (pid, total packages, total bytes, total bytes cleaned)
-    '''
-    
-    names = args[0]
-    folder = args[1]
-    package = None
-    pid = os.getpid()
-    wname = f'{folder}/worker.{pid}'
-    afile = open(wname, 'at')
+async def get_names_cached(ttl, cache_path, clear_cache=False):
+    """Get package names with caching."""
+    if clear_cache:
+        cache_path.unlink(missing_ok=True)
+    else:
+        cached = load_cache(cache_path, ttl)
+        if cached is not None:
+            logging.info("Loaded package names from cache")
+            return cached
+    # Fallback to fetch
+    names = await fetch_and_parse("https://pypi.org/simple/")
+    save_cache(cache_path, names)
+    return names
 
-    i = 0
-    total = 1.0*len(names)
-    packages_downloaded = 0
-    bytes_downloaded = 0
-    bytes_cleaned = 0
-    
-    # Load metadata at the start of the worker
-    metadata = load_metadata()  # New
 
-    for p in names:    
+async def fetch(url: str, session: ClientSession, semaphore: asyncio.Semaphore):
+    """Download a single URL using aiohttp with concurrency limit."""
+    async with semaphore:
         try:
-            i += 1
-            json_url = 'https://pypi.python.org/pypi/%s/json' % p
-            resp = session.get(json_url, timeout=30)
+            async with session.get(url, timeout=TIMEOUT) as response:
+                if response.status != 200:
+                    logging.debug(f"Failed to fetch {url}: {response.status}")
+                    return None
+                json = await response.json()
+                return json
+        except Exception as e:
+            return f"Error: {e}"
 
-            if not resp.status_code == requests.codes.ok:
-                resp.raise_for_status()
 
-            # get json
-            package = resp.json()        
-            
-            # print(json.dumps(package, indent=3))
+async def fetch_meta_data(names, url="https://pypi.python.org/pypi"):
+    """Fetch metadata for a list of package names from PyPI."""
+    # names = names[0:1000]
 
-            # write json info
-            json.dump(package, afile, indent=3)
-            afile.write(',\n')
-        except Exception as ex:
-            if not 'Not Found' in repr(ex):
-                logging.error('%s: %s' % (json_url, ex))
-                # time.sleep(random.uniform(1.0,2.5))
-            continue
+    urls = [f"{url}/{name}/json" for name in names]
 
-        info    = package['info']
-        name    = info['name']
-        version = info['version']
+    # Limit concurrency so we don’t overwhelm your machine or the remote server
+    semaphore = asyncio.Semaphore(1000)  # at most 100 simultaneous requests
+    results = []
+    chunk_size = 10000
 
-        # delete old versions if they are local
-        bytes_cleaned += prune(package['releases'], version)
+    async with aiohttp.ClientSession() as session:
+        with tqdm_asyncio(total=len(urls)) as pbar:
+            for i in range(0, len(urls), chunk_size):
+                batch = urls[i : i + chunk_size]
+                tasks = [fetch(url, session, semaphore) for url in batch]
+                finished = await asyncio.gather(*tasks)
 
-        
-        for url in package['urls']:
-            filename        = url['filename']
-            packagetype     = url['packagetype']
-            python_version  = url['python_version']
-            download_url    = url['url']                        
-            size            = url['size']
-            md5_digest      = url['md5_digest']        
-            
-            if is_package_downloaded(metadata, name, version, md5_digest):  # New
-                logging.warning('Already downloaded: %s' % filename)  # New
-                continue  # New
-            
-            if python_version not in python_versions:
-                python_versions[python_version] = 0
-            python_versions[python_version] += 1
-            
-            if packagetype not in package_types:
-                package_types[packagetype] = 0
-            package_types[packagetype] += 1
-            
-            extention = ''
-            if '.' in filename:
-                extension = filename.split('.')[-1]
+                results.extend(finished)
+                pbar.update(len(batch))  # update once per batch
 
-            if extension not in extensions:
-                extensions[extension] = 0
-            extensions[extension] += 1
+    results = [_ for _ in results if _ is not None]
 
-            if python_version not in PYTHON_VERSIONS:
-                logging.info('Skipping python version: %s, %s' % (python_version, filename))
-                continue
-    
-            if packagetype not in PACKAGE_TYPES:
-                logging.info('Skipping package type %s: %s' % (packagetype, filename))
-                continue
-                        
-            if extension not in EXTENSIONS:
-                logging.info(f'Skipping extension {extension}: {filename}')
-                continue
+    return results
 
-            if packagetype == 'bdist_wheel':
-                pkg = parse_wheel_filename(filename)
-                # print(filename)
-                # print(pkg.python_tags)
-                # print(pkg.abi_tags)
-                # print(pkg.platform_tags)
-                for p in pkg.platform_tags:
-                    if p not in platforms:
-                        platforms[p] = 0
-                    platforms[p] += 1
 
-                skip = False
-                for p in pkg.platform_tags:                
-                    if p not in PLATFORMS:
-                        logging.info(f'Skipping package platform: {p}, {filename}')
-                        skip = True
-                        break
-                if skip:
-                    continue
+async def fetch_meta_data_cached(
+    names, ttl, cache_path, clear_cache=False, url="https://pypi.python.org/pypi"
+):
+    """Fetch package metadata with caching."""
+    if clear_cache:
+        cache_path.unlink(missing_ok=True)
+    else:
+        cached = load_cache(cache_path, ttl)
+        if cached is not None:
+            logging.info("Loaded metadata from cache")
+            return cached
+    # Fallback to fetch
+    metadata = await fetch_meta_data(names, url=url)
+    save_cache(cache_path, metadata)
+    return metadata
 
-            # skip if already in repo
-            path = f'{folder}/{filename}'
-            if os.path.exists(path) and os.lstat(path).st_size == size:
-                logging.warning('Already local: %s' % filename)
-                continue
-            
+
+async def fetch_file(
+    url: str, session: ClientSession, semaphore: asyncio.Semaphore, repository
+):
+    """Download a single URL using aiohttp with concurrency limit."""
+
+    async with semaphore:
+        filename = Path(url).name
+        file_path = Path(repository) / filename
+        # print(f"Writing to: {file_path}")
+        try:
+            async with session.get(url, timeout=TIMEOUT) as response:
+                if response.status != 200:
+                    # logging.warning(f"Failed to fetch {url}: {response.status}")
+                    return None
+
+                # Write to file in chunks
+                async with aiofiles.open(file_path, "wb") as f:
+                    async for chunk in response.content.iter_chunked(
+                        1024 * 1024
+                    ):  # 1 MB chunks
+                        await f.write(chunk)
+
+                return str(file_path)
+
+        except Exception as e:
+            logging.error(f"Error fetching {url}: {e}", exc_info=True)
+            return None
+
+
+async def fetch_urls(urls, repository):
+    """Fetch multiple URLs concurrently and save to repository."""
+
+    total_bytes = sum(url["size"] for url in urls)
+    semaphore = asyncio.Semaphore(100)
+    results = []
+
+    async with aiohttp.ClientSession() as session:
+        with tqdm_asyncio(
+            total=total_bytes,
+            unit="GB",
+            unit_scale=1 / 1e9,  # convert bytes to GB
+            unit_divisor=1,
+            bar_format="{l_bar}{bar} {n:.2f}/{total:.2f} {unit} [{elapsed}<{remaining}, {rate_fmt}]",
+            desc="Downloading",
+        ) as pbar:
+
+            async def fetch_and_update(url):
+                filename = await fetch_file(
+                    url["url"], session, semaphore, repository=repository
+                )
+                if filename is not None:
+                    pbar.update(url["size"])
+                return filename
+
+            tasks = [fetch_and_update(url) for url in urls]
+
+            # as_completed yields tasks as they finish
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                results.append(result)
+
+    # Filter out None results
+    results = [r for r in results if r is not None]
+    return results
+
+
+def filter_in_python_versions(urls, python_versions):
+    """Filter URLs by Python versions."""
+    for url in urls:
+        if url["python_version"] in python_versions:
+            yield url
+
+
+def filter_in_package_types(urls, package_types):
+    """Filter URLs by package types."""
+    for url in urls:
+        if url["packagetype"] in package_types:
+            yield url
+
+
+def filter_in_extensions(urls, extensions):
+    """Filter URLs by file extensions."""
+    for url in urls:
+        filename = url["filename"]
+        suffixes = "".join(Path(filename).suffixes)  # e.g. '.tar.gz'
+        for ext in extensions:
+            # allow extensions with or without leading dot
+            ext = ext if ext.startswith(".") else f".{ext}"
+            if suffixes.endswith(ext):
+                yield url
+                break
+
+
+def filter_in_platforms(urls, platforms):
+    """Filter URLs by platform tags (for wheels)."""
+    for url in urls:
+        if url["packagetype"] == "bdist_wheel":
             try:
-                logging.info(f'downloading {download_url}')
-                resp = session.get(download_url, timeout=300)
-
-                if not resp.status_code == requests.codes.ok:
-                    resp.raise_for_status()
-                
-                # save file
-                with open(path,'wb') as w:
-                    w.write(resp.content)
-                
-                # sum total bytes and count
-                bytes_downloaded += size
-                packages_downloaded += 1
-
-                # Update metadata after successful download
-                update_metadata(metadata, name, version, size, md5_digest)  # New
-                save_metadata(metadata)  # New
-
-                # verify with md5
-                check = 'Ok' if hashlib.md5(resp.content).hexdigest() == md5_digest else 'md5 failed'
-                progress = int(i/total*100.0)
-                logging.warning('Downloaded: %-50s %s pid:%s %s%% [%s/%s]' % (filename,check,pid,progress,i,int(total)))
-                
-            except Exception as ex:
-                logging.error('Failed    : %s. %s' % (download_url, ex))
-            
-        # for testing, a minimal number of downloads will be specified
-        if MAX > 0 and i == MAX:
-            break
-
-    afile.close()
-
-    print(f'python versions seen : {list(python_versions.keys())}')
-    print(f'packages types  seen : {list(package_types.keys())}')
-    print(f'extensions seen      : {list(extensions.keys())}')
-    print(f'platforms seen       : {list(platforms.keys())}')
-    
-    return (pid, packages_downloaded, bytes_downloaded, bytes_cleaned)
+                pkg = parse_wheel_filename(url["filename"])
+                for p in pkg.platform_tags:
+                    if p in platforms:
+                        yield url
+                        break
+            except InvalidFilenameError:
+                logging.warning(f"Invalid wheel filename: {url['filename']}")
+                continue
+        else:
+            yield url  # non-wheel packages are always included
 
 
-def get_config(config_file):
-	config_file = config_file
+def filter_paths_exist(urls, repository):
+    """Filter out URLs whose files already exist in the repository."""
+    for url in urls:
+        filename = url["filename"]
+        path = f"{repository}/{filename}"
+        if not os.path.exists(path):
+            yield url
 
-	# Default repository path (only used if the config file does not exit)
-	repository = os.path.expanduser("~/minirepo")
 
-	processes = PROCESSES
-	try:
-		with open(config_file, 'r') as f:
-			config = json.load(f)
-	except (json.JSONDecodeError, FileNotFoundError):
-		newrepo = input(f'Repository folder [{repository}]: ')
-		if newrepo:
-			repository = newrepo
-		newprocesses = input(f'Number of processes [{processes}]: ')
-		if newprocesses:
-			processes = int(newprocesses)
-		config = {
-			"repository": repository,
-			"processes": processes,
-			"python_versions":PYTHON_VERSIONS,
-			"package_types": PACKAGE_TYPES,
-			"extensions": EXTENSIONS,
-			"platforms": PLATFORMS,
-		}
-		with open(config_file, 'w') as w:
-			json.dump(config, w, indent=2)
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
 
-	for c in sorted(config):
-		print('%-15s = %s' % (c,config[c]))
-	print('Using config file %s ' % config_file)
+    parser = argparse.ArgumentParser(description="Minirepo downloader")
 
-	return config
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=MINIREPO_CONFIG,
+        help="Path to config file (default: ~/.minirepo)",
+    )
+    parser.add_argument(
+        "-r", "--repository", help="Repository folder (overrides config)"
+    )
+    parser.add_argument(
+        "-p", "--python-versions", nargs="+", help="Python versions to include"
+    )
+    parser.add_argument(
+        "-t", "--package-types", nargs="+", help="Package types to include"
+    )
+    parser.add_argument("-e", "--extensions", nargs="+", help="Extensions to include")
+    parser.add_argument("-P", "--platforms", nargs="+", help="Platforms to include")
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the log level (default: WARNING)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging (overrides --log-level)",
+    )
+    parser.add_argument(
+        "--print-default-config",
+        action="store_true",
+        help="Print the default config as JSON and exit",
+    )
+    parser.add_argument(
+        "--names-cache-ttl",
+        type=int,
+        default=86400,
+        help="Cache TTL for package names (seconds, default=86400)",
+    )
+    parser.add_argument(
+        "--metadata-cache-ttl",
+        type=int,
+        default=86400,
+        help="Cache TTL for metadata (seconds, default=86400)",
+    )
+    parser.add_argument(
+        "--clear-names-cache", action="store_true", help="Clear the names cache"
+    )
+    parser.add_argument(
+        "--clear-metadata-cache", action="store_true", help="Clear the metadata cache"
+    )
 
-def save_json(pids):
-    # concatenate output from each worker
-    db = REPOSITORY + '/packages.json'
-    with open(db,'w') as w:
-        w.write('[\n')
-        for pid in pids:
-            wfile = f'{REPOSITORY}/worker.{pid}'
-            with open(wfile) as r:
-                w.write(r.read())
-            os.remove(wfile)
-            print('deleted: %s' % wfile)
-    
-    # remove tailing comma, remove last 2 characters (',\n')
-    with open(db, 'rb+') as w:
-        w.seek(-2, os.SEEK_END)
-        w.truncate()
+    return parser.parse_args()
 
-    # complete json list
-    with open(db, 'a') as a:
-        a.write('\n]\n')
 
-# def make_tarfile(tarfilename, directory):
-# 	import tarfile
-#     with tarfile.open(tarfilename, "w") as tar:
-#         tar.add(directory, arcname=os.path.basename(os.path.realpath(directory)))
+def get_config(config_file, cli_args) -> dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+    try:
+        with open(config_file, "r") as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        logging.warning(f"Config file ({config_file}) not found, using defaults")
 
-def main(repository='', processes=0):
-    global REPOSITORY, PROCESSES, PYTHON_VERSIONS, PACKAGE_TYPES, EXTENSIONS, PLATFORMS
-    
-    print('/******** Minirepo ********/')
-    
+    # CLI overrides
+    if cli_args.repository:
+        config["repository"] = cli_args.repository
+    if cli_args.python_versions:
+        config["python_versions"] = cli_args.python_versions
+    if cli_args.package_types:
+        config["package_types"] = cli_args.package_types
+    if cli_args.extensions:
+        config["extensions"] = cli_args.extensions
+    if cli_args.platforms:
+        config["platforms"] = cli_args.platforms
+
+    config["repository"] = os.path.expanduser(config["repository"])
+
+    for c in sorted(config):
+        print(f"{c:<15} = {config[c]}")
+
+    print(f"Using config file {config_file}")
+
+    return config
+
+
+def main(cli_args) -> NoReturn:
+
+    print("/******** Minirepo ********/")
+
     # get configuration values
-    
-    config_file = os.path.expanduser(
-		path=os.environ.get("MINIREPO_CONFIG", "~/.minirepo"))
+    config = get_config(cli_args.config, cli_args)
 
-    config 			= get_config(config_file=config_file)
-    REPOSITORY      = os.path.expanduser(config["repository"])
-    PROCESSES       = config["processes"]
-    PYTHON_VERSIONS = config["python_versions"]
-    PACKAGE_TYPES   = config["package_types"]
-    EXTENSIONS      = config["extensions"]
-    PLATFORMS       = config["platforms"]
-    
-    print(config)
+    if not os.path.isdir(config["repository"]):
+        os.mkdir(config["repository"])
+    assert os.path.isdir(config["repository"])
 
-    # overwrite with parameter
-    if repository:        
-        REPOSITORY = repository
-        print('Overridden:\nrepository      = %s' % repository)
-    if processes:    
-        PROCESSES = processes
-        print('Overridden:\nprocesses       = %s' % processes)
+    logging.info("starting minirepo mirror...")
 
-    assert REPOSITORY
-    assert PROCESSES
+    # Fetch the complete list of available packages
+    logging.info("getting packages names...")
 
-    if not os.path.isdir(REPOSITORY):
-        os.mkdir(REPOSITORY)
+    names = asyncio.run(
+        main=get_names_cached(
+            ttl=cli_args.names_cache_ttl,
+            cache_path=Path(config["repository"]) / ".names_cache",
+            clear_cache=cli_args.clear_names_cache,
+        )
+    )
 
-    assert os.path.isdir(REPOSITORY)
+    print(f"Got {len(names)} names")
 
-    logging.info('starting minirepo mirror...')
-    start = time.time()    
+    # Fetch package meta data
+    package_metadata = asyncio.run(
+        main=fetch_meta_data_cached(
+            names,
+            ttl=cli_args.metadata_cache_ttl,
+            cache_path=Path(config["repository"]) / ".metadata_cache",
+            clear_cache=cli_args.clear_metadata_cache,
+        )
+    )
 
-    # prepare
-    logging.info('getting packages names...')
-    names = get_names()
-    # print(f'names:\n{names}')
+    print(f"Got {len(package_metadata)} package_metadata")
 
-    pool = mp.Pool(int(PROCESSES))
-    random.shuffle(names)
-    chunks = list(get_chunks(names, PROCESSES))
-    
-    # run in parallel
-    # (pids, totals, bytes, cleaned)
-    results = pool.map_async(worker, zip(chunks, [REPOSITORY]*len(chunks))).get(timeout=99999)
-    
-    # get summary
-    pids                = [r[0] for r in results]
-    packages_downloaded = sum([r[1] for r in results])
-    bytes_downloaded    = sum([r[2] for r in results])
-    bytes_cleaned       = sum([r[3] for r in results])
+    # Filter out any versions that are already downloaded
+    # TBD
 
-    # store full list of packages in json format for later analysis
-    save_json(pids)
+    [print(f"string packages: {pkg}" for pkg in package_metadata if type(pkg) is str)]
 
-    # print summary
-    print('summary:')
-    print('packages downloaded = %s' % packages_downloaded)
-    print('bytes downloaded    = %s' % bytes_human(bytes_downloaded))
-    print('bytes cleaned       = %s' % bytes_human(bytes_cleaned))
-    
-    print('time:', (time.time()-start))
+    urls = [url for pkg in package_metadata for url in pkg["urls"]]
 
-    # logging.warning('making tar file...')
-    # tar = '/home/minirepo.tar'
-    # make_tarfile(tar, REPOSITORY)
-    logging.warning('minirepo mirror completed.')
+    print(f"Got {len(urls)} urls")
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s: %(message)s")
-    main()
+    filtered = list(filter_paths_exist(urls, repository=config["repository"]))
+    print(f"After filter_paths_exist {len(filtered)} filtered")
+
+    filtered = list(filter_in_platforms(filtered, platforms=config["platforms"]))
+    print(f"After filter_in_platforms {len(filtered)} filtered")
+    filtered = list(filter_in_extensions(filtered, extensions=config["extensions"]))
+    print(f"After filter_in_extensions {len(filtered)} filtered")
+    filtered = list(
+        filter_in_package_types(filtered, package_types=config["package_types"])
+    )
+    print(f"After filter_in_package_types {len(filtered)} filtered")
+    filtered = list(
+        filter_in_python_versions(filtered, python_versions=config["python_versions"])
+    )
+
+    print(f"After filter {len(filtered)} filtered")
+
+    # print(f"Filtered URLs: {[url['filename'] for url in filtered[:10]]}")
+
+    # sys.exit()
+    asyncio.run(fetch_urls(urls=filtered, repository=config["repository"]))
+
+    sys.exit()
+
+
+if __name__ == "__main__":
+    args: argparse.Namespace = parse_args()
+
+    if args.print_default_config:
+        print(json.dumps(DEFAULT_CONFIG, indent=4))
+        sys.exit(0)
+
+    # Set log level
+    log_level = (
+        logging.DEBUG if args.debug else getattr(logging, args.log_level.upper())
+    )
+    logging.basicConfig(
+        level=log_level, format="%(asctime)s:%(levelname)s: %(message)s"
+    )
+
+    main(args)
