@@ -114,51 +114,59 @@ async def get_names_cached(ttl, cache_path, clear_cache=False):
     return names
 
 
-async def fetch(url: str, session: ClientSession, semaphore: asyncio.Semaphore):
+async def fetch(url: str, session: ClientSession):
     """Download a single URL using aiohttp with concurrency limit."""
-    async with semaphore:
-        try:
-            async with session.get(url, timeout=TIMEOUT) as response:
-                if response.status != 200:
-                    logging.debug(f"Failed to fetch {url}: {response.status}")
-                    return None
-                json = await response.json()
-                return json
-        except Exception as e:
-            return f"Error: {e}"
-
-
-async def fetch_meta_data(names, url="https://pypi.python.org/pypi"):
-    """Fetch metadata for a list of package names from PyPI."""
     
-    names = names[0:1000]
+    try:
+        async with session.get(url, timeout=TIMEOUT) as response:
+            if response.status != 200:
+                logging.debug(f"Failed to fetch {url}: {response.status}")
+                return None
+            json = await response.json()
+            return json
+    except Exception as e:
+        logging.error(f"Error fetching {url}: {e}", exc_info=True)
 
+
+async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers=100):
+    """Fetch metadata for a list of package names from PyPI using worker tasks and a queue."""
+
+    names = names[:1000]
+    
     urls = [f"{url}/{name}/json" for name in names]
-
-    # Limit concurrency so we don’t overwhelm your machine or the remote server
-    semaphore = asyncio.Semaphore(1000)  # at most 100 simultaneous requests
     results = []
-    chunk_size = 10000
+    queue = asyncio.Queue()
+
+    for u in urls:
+        await queue.put(u)
 
     async with aiohttp.ClientSession() as session:
         with tqdm_asyncio(
-            total=len(urls),unit="GB",
-            unit_scale=1 / 1e9,
-            unit_divisor=1,
-            bar_format="{l_bar}{bar} {n:.2f}/{total:.2f} {unit} "
-                    "[{elapsed}<{remaining}, {rate_fmt}]",
+            total=len(urls),
+            unit="pkg",
+            unit_scale=True,
             desc="Fetching metadata",
-            ) as pbar:
-            for i in range(0, len(urls), chunk_size):
-                batch = urls[i : i + chunk_size]
-                tasks = [fetch(url, session, semaphore) for url in batch]
-                finished = await asyncio.gather(*tasks)
+        ) as pbar:
 
-                results.extend(finished)
-                pbar.update(len(batch))  # update once per batch
+            async def worker():
+                while True:
+                    try:
+                        u = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    meta = await fetch(u, session)
+                    if meta is not None:
+                        results.append(meta)
+                    pbar.update(1)
+                    queue.task_done()
+
+            tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
+            await queue.join()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     results = [_ for _ in results if _ is not None]
-
     return results
 
 
@@ -217,45 +225,45 @@ def prune_to_latest_version(package_metadata, repository, dry_run=False):
     return pruned
 
 async def fetch_file(
-    url: str, session: ClientSession, semaphore: asyncio.Semaphore, repository
+    url: str, session: ClientSession, repository
 ):
     """Download a single URL using aiohttp with concurrency limit."""
 
-    async with semaphore:
-        filename = Path(url).name
-        file_path = Path(repository) / filename
-        logging.debug(f"Writing to: {file_path}")
-        try:
-            async with session.get(url, timeout=TIMEOUT) as response:
-                if response.status != 200:
-                    # logging.warning(f"Failed to fetch {url}: {response.status}")
-                    return None
+    filename = Path(url).name
+    file_path = Path(repository) / filename
+    logging.debug(f"Writing to: {file_path}")
+    try:
+        async with session.get(url, timeout=TIMEOUT) as response:
+            if response.status != 200:
+                # logging.warning(f"Failed to fetch {url}: {response.status}")
+                return None
 
-                # Write to file in chunks
-                async with aiofiles.open(file_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(
-                        1024 * 1024
-                    ):  # 1 MB chunks
-                        await f.write(chunk)
+            # Write to file in chunks
+            async with aiofiles.open(file_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(
+                    1024 * 1024
+                ):  # 1 MB chunks
+                    await f.write(chunk)
 
-                return str(file_path)
+            return str(file_path)
 
-        except Exception as e:
-            logging.error(f"Error fetching {url}: {e}", exc_info=True)
-            return None
-
+    except Exception as e:
+        logging.error(f"Error fetching {url}: {e}", exc_info=True)
+        return None
 
 
 
-async def fetch_urls(urls, repository, batch_size=1000):
-    """Fetch multiple URLs concurrently and save to repository in batches."""
+async def fetch_urls(urls, repository, num_workers=100):
+    """Fetch multiple URLs concurrently using a fixed number of worker tasks and a queue."""
 
     total_bytes = sum(url["size"] for url in urls)
     results = []
+    queue = asyncio.Queue()
+
+    for url in urls:
+        await queue.put(url)
 
     async with aiohttp.ClientSession() as session:
-        semaphore = asyncio.Semaphore(100)
-
         with tqdm_asyncio(
             total=total_bytes,
             unit="GB",
@@ -266,26 +274,27 @@ async def fetch_urls(urls, repository, batch_size=1000):
             desc="Downloading",
         ) as pbar:
 
-            async def fetch_and_update(url):
-                filename = await fetch_file(
-                    url["url"], session, semaphore, repository=repository
-                )
-                if filename is not None:
-                    pbar.update(url["size"])
-                return filename
+            async def worker():
+                while True:
+                    try:
+                        url = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    filename = await fetch_file(
+                        url["url"], session, repository=repository
+                    )
+                    if filename is not None:
+                        pbar.update(url["size"])
+                        results.append(filename)
+                    queue.task_done()
 
-            # process in slices
-            for i in range(0, len(urls), batch_size):
-                batch = urls[i:i+batch_size]
-                tasks = [fetch_and_update(url) for url in batch]
-
-                for coro in asyncio.as_completed(tasks):
-                    result = await coro
-                    if result is not None:
-                        results.append(result)
+            tasks = [asyncio.create_task(worker()) for _ in range(num_workers)]
+            await queue.join()
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     return results
-
 
 def filter_in_python_versions(urls, python_versions):
     """Filter URLs by Python versions."""
