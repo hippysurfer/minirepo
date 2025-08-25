@@ -9,6 +9,7 @@ import os
 import time
 import logging
 import json
+import itertools
 from typing import Any, NoReturn
 import requests
 import asyncio
@@ -129,7 +130,8 @@ async def fetch(url: str, session: ClientSession, semaphore: asyncio.Semaphore):
 
 async def fetch_meta_data(names, url="https://pypi.python.org/pypi"):
     """Fetch metadata for a list of package names from PyPI."""
-    # names = names[0:1000]
+    
+    names = names[0:1000]
 
     urls = [f"{url}/{name}/json" for name in names]
 
@@ -139,7 +141,14 @@ async def fetch_meta_data(names, url="https://pypi.python.org/pypi"):
     chunk_size = 10000
 
     async with aiohttp.ClientSession() as session:
-        with tqdm_asyncio(total=len(urls)) as pbar:
+        with tqdm_asyncio(
+            total=len(urls),unit="GB",
+            unit_scale=1 / 1e9,
+            unit_divisor=1,
+            bar_format="{l_bar}{bar} {n:.2f}/{total:.2f} {unit} "
+                    "[{elapsed}<{remaining}, {rate_fmt}]",
+            desc="Fetching metadata",
+            ) as pbar:
             for i in range(0, len(urls), chunk_size):
                 batch = urls[i : i + chunk_size]
                 tasks = [fetch(url, session, semaphore) for url in batch]
@@ -178,7 +187,7 @@ async def fetch_file(
     async with semaphore:
         filename = Path(url).name
         file_path = Path(repository) / filename
-        # print(f"Writing to: {file_path}")
+        logging.debug(f"Writing to: {file_path}")
         try:
             async with session.get(url, timeout=TIMEOUT) as response:
                 if response.status != 200:
@@ -199,20 +208,24 @@ async def fetch_file(
             return None
 
 
-async def fetch_urls(urls, repository):
-    """Fetch multiple URLs concurrently and save to repository."""
+
+
+async def fetch_urls(urls, repository, batch_size=1000):
+    """Fetch multiple URLs concurrently and save to repository in batches."""
 
     total_bytes = sum(url["size"] for url in urls)
-    semaphore = asyncio.Semaphore(100)
     results = []
 
     async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(100)
+
         with tqdm_asyncio(
             total=total_bytes,
             unit="GB",
-            unit_scale=1 / 1e9,  # convert bytes to GB
+            unit_scale=1 / 1e9,
             unit_divisor=1,
-            bar_format="{l_bar}{bar} {n:.2f}/{total:.2f} {unit} [{elapsed}<{remaining}, {rate_fmt}]",
+            bar_format="{l_bar}{bar} {n:.2f}/{total:.2f} {unit} "
+                    "[{elapsed}<{remaining}, {rate_fmt}]",
             desc="Downloading",
         ) as pbar:
 
@@ -224,15 +237,16 @@ async def fetch_urls(urls, repository):
                     pbar.update(url["size"])
                 return filename
 
-            tasks = [fetch_and_update(url) for url in urls]
+            # process in slices
+            for i in range(0, len(urls), batch_size):
+                batch = urls[i:i+batch_size]
+                tasks = [fetch_and_update(url) for url in batch]
 
-            # as_completed yields tasks as they finish
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                results.append(result)
+                for coro in asyncio.as_completed(tasks):
+                    result = await coro
+                    if result is not None:
+                        results.append(result)
 
-    # Filter out None results
-    results = [r for r in results if r is not None]
     return results
 
 
@@ -289,6 +303,102 @@ def filter_paths_exist(urls, repository):
             yield url
 
 
+def get_config(config_file, cli_args) -> dict[str, Any]:
+    config = DEFAULT_CONFIG.copy()
+    try:
+        with open(config_file, "r") as f:
+            config.update(json.load(f))
+    except FileNotFoundError:
+        logging.warning(f"Config file ({config_file}) not found, using defaults")
+
+    # CLI overrides
+    if cli_args.repository:
+        config["repository"] = cli_args.repository
+    if cli_args.python_versions:
+        config["python_versions"] = cli_args.python_versions
+    if cli_args.package_types:
+        config["package_types"] = cli_args.package_types
+    if cli_args.extensions:
+        config["extensions"] = cli_args.extensions
+    if cli_args.platforms:
+        config["platforms"] = cli_args.platforms
+
+    config["repository"] = os.path.expanduser(config["repository"])
+
+    for c in sorted(config):
+        logging.debug(f"{c:<15} = {config[c]}")
+
+    logging.debug(f"Using config file {config_file}")
+
+    return config
+
+
+def main(cli_args) -> NoReturn:
+
+    logging.info("/******** Minirepo ********/")
+
+    # get configuration values
+    config = get_config(cli_args.config, cli_args)
+
+    if not os.path.isdir(config["repository"]):
+        os.mkdir(config["repository"])
+    assert os.path.isdir(config["repository"])
+
+    logging.info("starting minirepo mirror...")
+
+    # Fetch the complete list of available packages
+    logging.info("getting packages names...")
+
+    names = asyncio.run(
+        main=get_names_cached(
+            ttl=cli_args.names_cache_ttl,
+            cache_path=Path(config["repository"]) / ".names_cache",
+            clear_cache=cli_args.clear_names_cache,
+        )
+    )
+
+    logging.info(f"Got {len(names)} names")
+
+    # Fetch package meta data
+    package_metadata = asyncio.run(
+        main=fetch_meta_data_cached(
+            names,
+            ttl=cli_args.metadata_cache_ttl,
+            cache_path=Path(config["repository"]) / ".metadata_cache",
+            clear_cache=cli_args.clear_metadata_cache,
+        )
+    )
+
+    logging.info(f"Got {len(package_metadata)} package_metadata")
+
+    urls = [url for pkg in package_metadata for url in pkg["urls"]]
+
+    logging.info(f"Got {len(urls)} urls")
+
+    filtered = list(filter_paths_exist(urls, repository=config["repository"]))
+    logging.info(f"After filter_paths_exist {len(filtered)} filtered")
+
+    filtered = list(filter_in_platforms(filtered, platforms=config["platforms"]))
+    logging.info(f"After filter_in_platforms {len(filtered)} filtered")
+    filtered = list(filter_in_extensions(filtered, extensions=config["extensions"]))
+    logging.info(f"After filter_in_extensions {len(filtered)} filtered")
+    filtered = list(
+        filter_in_package_types(filtered, package_types=config["package_types"])
+    )
+    logging.info(f"After filter_in_package_types {len(filtered)} filtered")
+    filtered = list(
+        filter_in_python_versions(filtered, python_versions=config["python_versions"])
+    )
+
+    logging.info(f"After filter {len(filtered)} filtered")
+
+    # print(f"Filtered URLs: {[url['filename'] for url in filtered[:10]]}")
+
+    # sys.exit()
+    asyncio.run(fetch_urls(urls=filtered, repository=config["repository"]))
+
+    sys.exit()
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
 
@@ -312,10 +422,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-e", "--extensions", nargs="+", help="Extensions to include")
     parser.add_argument("-P", "--platforms", nargs="+", help="Platforms to include")
     parser.add_argument(
-        "--log-level",
-        default="WARNING",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the log level (default: WARNING)",
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v = INFO, -vv = DEBUG, default = WARNING)",
     )
     parser.add_argument(
         "--debug",
@@ -348,109 +459,6 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
-def get_config(config_file, cli_args) -> dict[str, Any]:
-    config = DEFAULT_CONFIG.copy()
-    try:
-        with open(config_file, "r") as f:
-            config.update(json.load(f))
-    except FileNotFoundError:
-        logging.warning(f"Config file ({config_file}) not found, using defaults")
-
-    # CLI overrides
-    if cli_args.repository:
-        config["repository"] = cli_args.repository
-    if cli_args.python_versions:
-        config["python_versions"] = cli_args.python_versions
-    if cli_args.package_types:
-        config["package_types"] = cli_args.package_types
-    if cli_args.extensions:
-        config["extensions"] = cli_args.extensions
-    if cli_args.platforms:
-        config["platforms"] = cli_args.platforms
-
-    config["repository"] = os.path.expanduser(config["repository"])
-
-    for c in sorted(config):
-        print(f"{c:<15} = {config[c]}")
-
-    print(f"Using config file {config_file}")
-
-    return config
-
-
-def main(cli_args) -> NoReturn:
-
-    print("/******** Minirepo ********/")
-
-    # get configuration values
-    config = get_config(cli_args.config, cli_args)
-
-    if not os.path.isdir(config["repository"]):
-        os.mkdir(config["repository"])
-    assert os.path.isdir(config["repository"])
-
-    logging.info("starting minirepo mirror...")
-
-    # Fetch the complete list of available packages
-    logging.info("getting packages names...")
-
-    names = asyncio.run(
-        main=get_names_cached(
-            ttl=cli_args.names_cache_ttl,
-            cache_path=Path(config["repository"]) / ".names_cache",
-            clear_cache=cli_args.clear_names_cache,
-        )
-    )
-
-    print(f"Got {len(names)} names")
-
-    # Fetch package meta data
-    package_metadata = asyncio.run(
-        main=fetch_meta_data_cached(
-            names,
-            ttl=cli_args.metadata_cache_ttl,
-            cache_path=Path(config["repository"]) / ".metadata_cache",
-            clear_cache=cli_args.clear_metadata_cache,
-        )
-    )
-
-    print(f"Got {len(package_metadata)} package_metadata")
-
-    # Filter out any versions that are already downloaded
-    # TBD
-
-    [print(f"string packages: {pkg}" for pkg in package_metadata if type(pkg) is str)]
-
-    urls = [url for pkg in package_metadata for url in pkg["urls"]]
-
-    print(f"Got {len(urls)} urls")
-
-    filtered = list(filter_paths_exist(urls, repository=config["repository"]))
-    print(f"After filter_paths_exist {len(filtered)} filtered")
-
-    filtered = list(filter_in_platforms(filtered, platforms=config["platforms"]))
-    print(f"After filter_in_platforms {len(filtered)} filtered")
-    filtered = list(filter_in_extensions(filtered, extensions=config["extensions"]))
-    print(f"After filter_in_extensions {len(filtered)} filtered")
-    filtered = list(
-        filter_in_package_types(filtered, package_types=config["package_types"])
-    )
-    print(f"After filter_in_package_types {len(filtered)} filtered")
-    filtered = list(
-        filter_in_python_versions(filtered, python_versions=config["python_versions"])
-    )
-
-    print(f"After filter {len(filtered)} filtered")
-
-    # print(f"Filtered URLs: {[url['filename'] for url in filtered[:10]]}")
-
-    # sys.exit()
-    asyncio.run(fetch_urls(urls=filtered, repository=config["repository"]))
-
-    sys.exit()
-
-
 if __name__ == "__main__":
     args: argparse.Namespace = parse_args()
 
@@ -459,9 +467,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Set log level
-    log_level = (
-        logging.DEBUG if args.debug else getattr(logging, args.log_level.upper())
-    )
+    if args.verbose >= 2:
+        log_level = logging.DEBUG
+    elif args.verbose == 1:
+        log_level = logging.INFO
+    else:
+        log_level = logging.WARNING
+        
     logging.basicConfig(
         level=log_level, format="%(asctime)s:%(levelname)s: %(message)s"
     )

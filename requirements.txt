@@ -1,4 +1,10 @@
-bs4==0.0.2
-requests==2.32.3
-wheel-filename==1.4.1
 
+requests
+wheel-filename
+asyncio
+aiofiles
+lxml
+aiohttp
+tqdm
+pytest
+pytest_asyncio
