@@ -178,6 +178,43 @@ async def fetch_meta_data_cached(
     save_cache(cache_path, metadata)
     return metadata
 
+def prune_to_latest_version(package_metadata, repository, dry_run=False):
+    """
+    For each package, keep only files for the latest version.
+    Removes files for older versions.
+    """
+    pruned = []
+    for pkg in package_metadata:
+        latest_version = pkg.get("info", {}).get("version")
+        releases = pkg.get("releases", [])
+        # Only keep URLs matching the latest version
+        try:
+            logging.debug(f"Pruning package {pkg.get('info', {}).get('name')} to version {latest_version}")
+            filtered_releases = [
+                (version, releases[version]) for version in releases
+                if version != latest_version
+            ]
+            logging.debug(f"Found {len(filtered_releases)} old version URLs to prune")
+            old_versions = [version for version,release in filtered_releases]
+            logging.debug(f"Old version URLs: {old_versions}")
+            filtered_filenames = []
+            for version, releases in filtered_releases:
+                for release in releases:
+                    if (release.get('filename') and 
+                        Path(repository).joinpath(release.get('filename')).exists()):
+                        filtered_filenames.append(release.get('filename'))
+            logging.debug(f"Filtered filenames to remove: {filtered_filenames}")
+            if not dry_run:
+                for file_name in filtered_filenames:
+                    path = Path(repository) / file_name
+                    if path.exists():
+                        logging.debug(f"Removing old version file: {path}")
+                        path.unlink(missing_ok=True)
+            pruned.extend(filtered_filenames)
+        except InvalidFilenameError as e:
+            logging.warning(f"Invalid wheel filename while pruning: {e}")
+            continue
+    return pruned
 
 async def fetch_file(
     url: str, session: ClientSession, semaphore: asyncio.Semaphore, repository
@@ -397,6 +434,12 @@ def main(cli_args) -> NoReturn:
     # sys.exit()
     asyncio.run(fetch_urls(urls=filtered, repository=config["repository"]))
 
+    if cli_args.prune:
+        logging.info("Pruning old package versions...")
+        pruned_files = prune_to_latest_version(
+            package_metadata, repository=config["repository"], dry_run=False
+        )
+        logging.info(f"Pruned {len(pruned_files)} old package files")
     sys.exit()
 
 def parse_args() -> argparse.Namespace:
@@ -439,6 +482,11 @@ def parse_args() -> argparse.Namespace:
         help="Print the default config as JSON and exit",
     )
     parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Prune old package versions from the repository after download",
+    )
+    parser.add_argument(
         "--names-cache-ttl",
         type=int,
         default=86400,
@@ -473,6 +521,9 @@ if __name__ == "__main__":
         log_level = logging.INFO
     else:
         log_level = logging.WARNING
+        
+    if args.debug:
+        log_level = logging.DEBUG
         
     logging.basicConfig(
         level=log_level, format="%(asctime)s:%(levelname)s: %(message)s"
