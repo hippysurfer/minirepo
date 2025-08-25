@@ -132,7 +132,7 @@ def minify_meta(json):
     meta['urls'] = []
     for url in json.get("urls", []):
         meta['urls'].append(
-        {'url': url.get('filename'), 
+        {'url': url.get('url'), 
          'filename': url.get('filename'),
          'packagetype': url.get('packagetype'),
          'python_version': url.get('python_version'),
@@ -325,6 +325,8 @@ async def fetch_file(
 async def fetch_urls(urls, repository, num_workers=WORKERS):
     """Fetch multiple URLs concurrently using a fixed number of worker tasks and a queue."""
 
+    urls = list(urls)
+    
     total_bytes = sum(url["size"] for url in urls)
     results = []
     queue = asyncio.Queue()
@@ -494,26 +496,25 @@ def main(cli_args) -> NoReturn:
     #logging.debug("Sample package metadata:")
     #for pkg in itertools.islice(package_metadata, 3):
     #    logging.debug(json.dumps(pkg, indent=4))
-    urls = [url for pkg in package_metadata for url in pkg["urls"]]
+    urls = (url for pkg in package_metadata for url in pkg["urls"])
 
-    logging.info(f"Got {len(urls)} urls")
+    #logging.info(f"Got {len(urls)} urls")
 
-    filtered = list(filter_paths_exist(urls, repository=config["repository"]))
-    logging.info(f"After filter_paths_exist {len(filtered)} filtered")
+    filtered = filter_paths_exist(urls, repository=config["repository"])
+    #logging.info(f"After filter_paths_exist {len(filtered)} filtered")
 
-    filtered = list(filter_in_platforms(filtered, platforms=config["platforms"]))
-    logging.info(f"After filter_in_platforms {len(filtered)} filtered")
-    filtered = list(filter_in_extensions(filtered, extensions=config["extensions"]))
-    logging.info(f"After filter_in_extensions {len(filtered)} filtered")
-    filtered = list(
-        filter_in_package_types(filtered, package_types=config["package_types"])
+    filtered = filter_in_platforms(filtered, platforms=config["platforms"])
+    
+    #logging.info(f"After filter_in_platforms {len(filtered)} filtered")
+    filtered = filter_in_extensions(filtered, extensions=config["extensions"])
+    
+    #logging.info(f"After filter_in_extensions {len(filtered)} filtered")
+    filtered = filter_in_package_types(filtered, package_types=config["package_types"]
     )
-    logging.info(f"After filter_in_package_types {len(filtered)} filtered")
-    filtered = list(
-        filter_in_python_versions(filtered, python_versions=config["python_versions"])
-    )
+    #logging.info(f"After filter_in_package_types {len(filtered)} filtered")
+    filtered = filter_in_python_versions(filtered, python_versions=config["python_versions"])
 
-    logging.info(f"After filter {len(filtered)} filtered")
+    #logging.info(f"After filter {len(filtered)} filtered")
     
     asyncio.run(fetch_urls(
         urls=filtered, 
