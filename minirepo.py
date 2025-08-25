@@ -23,10 +23,12 @@ from wheel_filename import parse_wheel_filename, InvalidFilenameError
 
 TIMEOUT: ClientTimeout = aiohttp.ClientTimeout(
     total=300,  # maximum total request time
-    connect=10,  # time to establish connection
-    sock_connect=10,  # time to wait before socket connect
+    connect=60,  # time to establish connection
+    sock_connect=60,  # time to wait before socket connect
     sock_read=100,  # time to wait between reads
 )
+
+WORKERS = 10  # number of concurrent download workers
 
 MINIREPO_CONFIG = os.path.expanduser(os.environ.get("MINIREPO_CONFIG", "~/.minirepo"))
 
@@ -128,7 +130,7 @@ async def fetch(url: str, session: ClientSession):
         logging.error(f"Error fetching {url}: {e}", exc_info=True)
 
 
-async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers=100):
+async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers=WORKERS):
     """Fetch metadata for a list of package names from PyPI using worker tasks and a queue."""
 
     urls = [f"{url}/{name}/json" for name in names]
@@ -169,7 +171,10 @@ async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers
 
 
 async def fetch_meta_data_cached(
-    names, ttl, cache_path, clear_cache=False, url="https://pypi.python.org/pypi"
+    names, ttl, cache_path, 
+    clear_cache=False,
+    num_workers=WORKERS,
+    url="https://pypi.python.org/pypi"
 ):
     """Fetch package metadata with caching."""
     if clear_cache:
@@ -180,7 +185,8 @@ async def fetch_meta_data_cached(
             logging.info("Loaded metadata from cache")
             return cached
     # Fallback to fetch
-    metadata = await fetch_meta_data(names, url=url)
+    metadata = await fetch_meta_data(
+        names, num_workers=num_workers, url=url)
     save_cache(cache_path, metadata)
     return metadata
 
@@ -251,7 +257,7 @@ async def fetch_file(
 
 
 
-async def fetch_urls(urls, repository, num_workers=100):
+async def fetch_urls(urls, repository, num_workers=WORKERS):
     """Fetch multiple URLs concurrently using a fixed number of worker tasks and a queue."""
 
     total_bytes = sum(url["size"] for url in urls)
@@ -411,6 +417,7 @@ def main(cli_args) -> NoReturn:
     package_metadata = asyncio.run(
         main=fetch_meta_data_cached(
             names,
+            num_workers=cli_args.num_workers,
             ttl=cli_args.metadata_cache_ttl,
             cache_path=Path(config["repository"]) / ".metadata_cache",
             clear_cache=cli_args.clear_metadata_cache,
@@ -439,11 +446,11 @@ def main(cli_args) -> NoReturn:
     )
 
     logging.info(f"After filter {len(filtered)} filtered")
-
-    # print(f"Filtered URLs: {[url['filename'] for url in filtered[:10]]}")
-
-    # sys.exit()
-    asyncio.run(fetch_urls(urls=filtered, repository=config["repository"]))
+    
+    asyncio.run(fetch_urls(
+        urls=filtered, 
+        repository=config["repository"],
+        num_workers=cli_args.num_workers))
 
     if cli_args.prune:
         logging.info("Pruning old package versions...")
@@ -517,6 +524,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit", type=int, default=0, help="Limit to first N packages (for testing)"
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=10, help="Number of concurrent workers (default=10)"
     )
 
     return parser.parse_args()
