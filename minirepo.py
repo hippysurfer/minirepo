@@ -132,7 +132,11 @@ def minify_meta(json):
     meta['urls'] = []
     for url in json.get("urls", []):
         meta['urls'].append(
-        {'url': url.get('filename'), 'filename': url.get('filename')})
+        {'url': url.get('filename'), 
+         'filename': url.get('filename'),
+         'packagetype': url.get('packagetype'),
+         'python_version': url.get('python_version'),
+         'size': url.get('size'),})
         
     return meta
     
@@ -149,18 +153,36 @@ async def fetch(url: str, session: ClientSession):
     except Exception as e:
         logging.error(f"Error fetching {url}: {e}", exc_info=True)
 
+def sanitize_json(obj):
+    """Recursively replace newlines in all string values in a dict."""
+    if isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    elif isinstance(obj, str):
+        return obj.replace("\n", "\\n")
+    else:
+        return obj
+    
 
-async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers=WORKERS):
-    """Fetch metadata for a list of package names from PyPI using worker tasks and a queue."""
+async def fetch_meta_data(
+    names, 
+    num_workers, 
+    cache_path,
+    url="https://pypi.python.org/pypi"
+):
+    """Fetch metadata for a list of package names and stream to a file."""
 
     urls = [f"{url}/{name}/json" for name in names]
-    results = []
     queue = asyncio.Queue()
 
     for u in urls:
         await queue.put(u)
 
-    async with aiohttp.ClientSession() as session:
+    cache_path.write_text("")
+    
+    async with aiohttp.ClientSession() as session, aiofiles.open(cache_path, "w") as out_file:
+        write_lock = asyncio.Lock()
         with tqdm_asyncio(
             total=len(urls),
             unit="pkg",
@@ -176,7 +198,9 @@ async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers
                         break
                     meta = await fetch(u, session)
                     if meta is not None:
-                        results.append(meta)
+                        meta = sanitize_json(meta)
+                        async with write_lock:
+                            await out_file.write(json.dumps(meta, ensure_ascii=True) + "\n")
                     pbar.update(1)
                     queue.task_done()
 
@@ -185,10 +209,8 @@ async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    results = [_ for _ in results if _ is not None]
-    return results
-
+            
+    return cache_path
 
 async def fetch_meta_data_cached(
     names, ttl, cache_path, 
@@ -199,17 +221,40 @@ async def fetch_meta_data_cached(
     """Fetch package metadata with caching."""
     if clear_cache:
         cache_path.unlink(missing_ok=True)
-    else:
-        cached = load_cache(cache_path, ttl)
-        if cached is not None:
-            logging.info("Loaded metadata from cache")
-            return cached
+    if cache_path.exists():
+        mtime = cache_path.stat().st_mtime
+        if time.time() - mtime < ttl:
+            logging.info("Loaded package metadata from cache")
+            return stream_metadata_rows(path=cache_path)
+    
     # Fallback to fetch
-    metadata = await fetch_meta_data(
-        names, num_workers=num_workers, url=url)
-    save_cache(cache_path, metadata)
-    return metadata
+    cache_path = await fetch_meta_data(
+        names, cache_path=cache_path,
+        num_workers=num_workers, url=url)
+    
+    return stream_metadata_rows(path=cache_path)
 
+def unsanitize_json(obj):
+    """Recursively convert '\\n' back to '\n' in all string values."""
+    if isinstance(obj, dict):
+        return {k: unsanitize_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [unsanitize_json(v) for v in obj]
+    elif isinstance(obj, str):
+        return obj.replace("\\n", "\n")
+    else:
+        return obj
+
+def stream_metadata_rows(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+                yield unsanitize_json(obj)
+            except json.JSONDecodeError as e:
+                logging.warning(f"Skipping invalid JSON line: {e}: content={line}")
+                continue
+            
 def prune_to_latest_version(package_metadata, repository, dry_run=False):
     """
     For each package, keep only files for the latest version.
@@ -444,8 +489,11 @@ def main(cli_args) -> NoReturn:
         )
     )
 
-    logging.info(f"Got {len(package_metadata)} package_metadata")
+    #logging.info(f"Got {len(list(package_metadata))} package_metadata")
 
+    #logging.debug("Sample package metadata:")
+    #for pkg in itertools.islice(package_metadata, 3):
+    #    logging.debug(json.dumps(pkg, indent=4))
     urls = [url for pkg in package_metadata for url in pkg["urls"]]
 
     logging.info(f"Got {len(urls)} urls")
