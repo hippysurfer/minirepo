@@ -131,8 +131,6 @@ async def fetch(url: str, session: ClientSession):
 async def fetch_meta_data(names, url="https://pypi.python.org/pypi", num_workers=100):
     """Fetch metadata for a list of package names from PyPI using worker tasks and a queue."""
 
-    names = names[:1000]
-    
     urls = [f"{url}/{name}/json" for name in names]
     results = []
     queue = asyncio.Queue()
@@ -405,6 +403,10 @@ def main(cli_args) -> NoReturn:
 
     logging.info(f"Got {len(names)} names")
 
+    if cli_args.limit:
+        names = names[: cli_args.limit]
+        logging.info(f"Limiting to first {len(names)} names")   
+        
     # Fetch package meta data
     package_metadata = asyncio.run(
         main=fetch_meta_data_cached(
@@ -512,6 +514,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--clear-metadata-cache", action="store_true", help="Clear the metadata cache"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=0, help="Limit to first N packages (for testing)"
     )
 
     return parser.parse_args()
