@@ -116,6 +116,26 @@ async def get_names_cached(ttl, cache_path, clear_cache=False):
     return names
 
 
+def minify_meta(json):
+    """Minify the package metadata to only include necessary fields."""
+    
+    meta = {
+        "info": {
+            "name": json.get("info", {}).get("name"),
+            "version": json.get("info", {}).get("version"),
+        }}
+    meta['releases'] = {}
+    for version, files, in json.get("releases", {}).items():
+        meta['releases'][version] = [
+            {'filename': file.get('filename') for file in files}]
+        
+    meta['urls'] = []
+    for url in json.get("urls", []):
+        meta['urls'].append(
+        {'url': url.get('filename'), 'filename': url.get('filename')})
+        
+    return meta
+    
 async def fetch(url: str, session: ClientSession):
     """Download a single URL using aiohttp with concurrency limit."""
     
@@ -125,7 +145,7 @@ async def fetch(url: str, session: ClientSession):
                 logging.debug(f"Failed to fetch {url}: {response.status}")
                 return None
             json = await response.json()
-            return json
+            return minify_meta(json)
     except Exception as e:
         logging.error(f"Error fetching {url}: {e}", exc_info=True)
 
